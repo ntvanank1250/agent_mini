@@ -1,9 +1,500 @@
 ---
-description: Hướng dẫn chi tiết cho AI Copilot khi làm việc với AI Agent Telegram Bot Project
-applyTo: '**/*.{py,sh,md,yml,env}'
+description: Hướng dẫn kỹ thuật chi tiết cho AI Copilot - AI Agent Telegram Bot Project (v1.2)
+applyTo: '**/*.{py,sh,md,yml,env,json}'
 ---
 
-# 🤖 AI AGENT TELEGRAM BOT - TECHNICAL INSTRUCTIONS
+# 🤖 AI AGENT TELEGRAM BOT - TECHNICAL SPECIFICATIONS (v1.2)
+
+**Status:** ✅ Production Ready | **Updated:** 2026-02-27 | **Language:** Vietnamese
+
+## 📋 PROJECT OVERVIEW
+
+### Mục Tiêu
+Xây dựng hệ thống **AI Agent local hoàn toàn** trên Linux 8-15GB RAM, cho phép:
+- Tương tác qua Telegram Messenger
+- Sử dụng Ollama qwen2.5:7b (mô hình LLM tối ưu tiếng Việt)
+- Quản lý nhiều user thông qua whitelist
+- Lưu trữ conversation history (SQLite)
+- Xử lý file text tự động
+- Monitor system resources real-time
+
+### Key Features (v1.2)
+- **Whitelist System**: `/add`, `/remove`, `/whitelist` - quản lý user
+- **8-Thread Optimization**: Tận dụng multi-core CPU
+- **Temperature 0.3**: Tăng tính chính xác, giảm hallucination
+- **Vietnamese Enforcement**: System prompt + example enforcing Tiếng Việt
+- **Lock-based Queue**: Serialize AI requests (no race conditions)
+- **SQLite Whitelist Table**: DDL included, auto-created
+
+## 🏗️ SYSTEM ARCHITECTURE
+
+### Components Diagram
+```
+┌──────────────────────────────────────────┐
+│       Telegram Users (Multiple)           │
+│  ├─ Admin (ADMIN_CHAT_ID)                │
+│  └─ Whitelisted (in DB whitelist table)  │
+└─────────────────────┬────────────────────┘
+                      │ (Telegram API)
+                      ▼
+┌──────────────────────────────────────────┐
+│    python-telegram-bot (20.7)             │
+│    - Application.build()                  │
+│    - Polling updater                      │
+│    - Async handlers                       │
+└─────────────────────┬────────────────────┘
+                      │
+                      ▼
+┌──────────────────────────────────────────┐
+│   tele_agent.py Main Module               │
+│                                            │
+│  ├─ Config (lines 54-84)                 │
+│  │   ├─ OLLAMA_THREADS=8                 │
+│  │   ├─ OLLAMA_MODEL=qwen2.5:7b          │
+│  │   └─ MAX_MESSAGE_LENGTH=4000          │
+│  │                                        │
+│  ├─ ChatDatabase (lines 90-180)          │
+│  │   ├─ conversations table               │
+│  │   ├─ users table                       │
+│  │   ├─ **whitelist table (NEW)**        │
+│  │   └─ Methods: get_history, add_to_*   │
+│  │                                        │
+│  ├─ RequestQueue (lines 194-246)         │
+│  │   ├─ async Lock (serialization)       │
+│  │   ├─ enqueue(chat_id) → position     │
+│  │   └─ mark_done(chat_id)               │
+│  │                                        │
+│  ├─ AIAgent (lines 343-468)              │
+│  │   ├─ generate_response()              │
+│  │   ├─ _call_ollama() [CPU inference]   │
+│  │   └─ process_file()                   │
+│  │                                        │
+│  ├─ Handlers (lines 520-705)             │
+│  │   ├─ start_handler()                  │
+│  │   ├─ **add_user_handler()** (NEW)     │
+│  │   ├─ **remove_user_handler()** (NEW)  │
+│  │   ├─ **whitelist_handler()** (NEW)    │
+│  │   ├─ message_handler()                │
+│  │   └─ document_handler()               │
+│  │                                        │
+│  └─ setup_application()                  │
+│      ├─ Add all handlers                 │
+│      └─ Attach to app                    │
+│                                            │
+└─────────────────────┬────────────────────┘
+                      │ ollama.chat() API
+                      ▼
+┌──────────────────────────────────────────┐
+│    Ollama (localhost:11434)               │
+│                                            │
+│    Model: qwen2.5:7b (4.7GB)             │
+│    ├─ Threads: 8 cores                   │
+│    ├─ Context: 4096 tokens               │
+│    ├─ Temperature: 0.3 (low)             │
+│    ├─ Top-K: 30, Top-P: 0.8             │
+│    └─ Repeat Penalty: 1.2                │
+│                                            │
+│    Inference Time: ~5-10s on CPU         │
+└──────────────────────────────────────────┘
+
+Data Flow:
+User → TG API → message_handler → enqueue → lock → AIAgent → ollama.chat()
+                                                    → SQLite save → TG reply
+```
+
+## 📝 IMPLEMENTATION DETAILS
+
+### 1. tele_agent.py (873 lines)
+
+#### Config Class (lines 54-84)
+```python
+class Config:
+    # Telegram
+    TELEGRAM_API_TOKEN = os.getenv('TELEGRAM_API_TOKEN', '')
+    ADMIN_CHAT_ID = int(os.getenv('ADMIN_CHAT_ID', 0))
+    
+    # Ollama
+    OLLAMA_URL = 'http://localhost:11434'
+    OLLAMA_MODEL = 'qwen2.5:7b'
+    OLLAMA_THREADS = 8  # ← OPTIMIZED for 12-core CPU
+    
+    # Queue & Memory
+    MAX_WORKERS = 1
+    HISTORY_LIMIT = 20
+    
+    def __init__(self):
+        if not self.TELEGRAM_API_TOKEN:
+            raise ValueError("TELEGRAM_API_TOKEN not set in .env file")
+```
+
+**Key Changes in v1.2:**
+- OLLAMA_THREADS: 4 → 8 (tận dụng CPU đa-lõi)
+- Temperature: 0.7 → 0.3 (tăng chính xác)
+- Repeat_penalty: 1.1 → 1.2 (tránh lặp)
+
+#### ChatDatabase Class (lines 90-180)
+
+**Original Tables:**
+```sql
+CREATE TABLE conversations (
+    id INTEGER PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    user TEXT NOT NULL,
+    role TEXT NOT NULL,           -- 'user' or 'assistant'
+    content TEXT NOT NULL,
+    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+    tokens INTEGER DEFAULT 0
+);
+
+CREATE TABLE users (
+    chat_id INTEGER PRIMARY KEY,
+    username TEXT UNIQUE,
+    first_seen DATETIME DEFAULT CURRENT_TIMESTAMP,
+    message_count INTEGER DEFAULT 0
+);
+```
+
+**NEW in v1.2 - Whitelist Table:**
+```sql
+CREATE TABLE whitelist (
+    chat_id INTEGER PRIMARY KEY,
+    username TEXT,
+    added_by INTEGER,              -- Admin who added
+    added_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+```
+
+**New Methods:**
+```python
+def add_to_whitelist(self, chat_id: int, username: str, added_by: int) -> bool:
+    """Insert or replace into whitelist table"""
+    
+def remove_from_whitelist(self, chat_id: int) -> bool:
+    """Delete from whitelist"""
+    
+def is_whitelisted(self, chat_id: int) -> bool:
+    """Check if user is whitelisted"""
+    
+def get_whitelist(self) -> List[tuple]:
+    """Return all whitelisted (chat_id, username)"""
+```
+
+#### RequestQueue Class (lines 194-246)
+
+**Serialization via asyncio.Lock:**
+```python
+class RequestQueue:
+    def __init__(self, max_workers: int = 1):
+        self.lock = asyncio.Lock()        # ← NEW
+        self.waiting_users: Dict[int, int] = {}
+    
+    async def enqueue(self, chat_id, username, message) -> int:
+        """Return position: 0 = immediate, >0 = queued"""
+        if self.lock.locked():
+            position = len(self.waiting_users) + 1
+        else:
+            position = 0
+        self.waiting_users[chat_id] = position
+        return position
+```
+
+**Usage in message_handler (lines 698-726):**
+```python
+# In message_handler()
+async with queue_manager.lock:
+    try:
+        response = await ai_agent.generate_response(...)
+    finally:
+        queue_manager.mark_done(chat_id)
+```
+
+Result: No race conditions, strict serialization of AI calls.
+
+#### AIAgent Class (lines 343-468)
+
+**generate_response() method:**
+```python
+async def generate_response(self, chat_id, username, user_message) -> str:
+    # 1. Get history (LIMIT 20)
+    history = db.get_history(chat_id, limit=20)
+    
+    # 2. Build messages with ENFORCED system prompt
+    system_prompt = """You are a helpful AI assistant. 
+    You MUST respond ONLY in Vietnamese language.
+    If you don't have real-time information, clearly state you don't...
+    """
+    
+    # 3. Add example conversation (Vietnamese)
+    # This teaches model to respond in Vietnamese
+    
+    # 4. Call Ollama
+    response = await asyncio.to_thread(
+        self._call_ollama, context_messages
+    )
+    
+    # 5. Save to DB
+    db.add_message(chat_id, username, 'user', user_message)
+    db.add_message(chat_id, username, 'assistant', response)
+    
+    return response
+```
+
+**_call_ollama() method:**
+```python
+def _call_ollama(self, messages: List[Dict]) -> str:
+    """Blocking call to Ollama API"""
+    response = ollama.chat(
+        model=self.model,
+        messages=messages,
+        stream=False,
+        options={
+            'num_thread': 8,
+            'num_ctx': 4096,
+            'temperature': 0.3,    # Low for consistency
+            'repeat_penalty': 1.2,
+            'top_p': 0.8,
+            'top_k': 30,
+        }
+    )
+    return response['message']['content']
+```
+
+#### Authorization Rules (lines 517-529)
+
+**Original:**
+```python
+def require_admin(func):
+    @wraps(func)
+    async def wrapper(update, context):
+        if update.effective_chat.id != config.ADMIN_CHAT_ID:
+            await update.message.reply_text("❌ Truy cập bị từ chối")
+            return
+```
+
+**NEW in v1.2:**
+```python
+def require_admin(func):
+    @wraps(func)
+    async def wrapper(update, context):
+        chat_id = update.effective_chat.id
+        # Check if admin OR whitelisted
+        if chat_id == config.ADMIN_CHAT_ID or db.is_whitelisted(chat_id):
+            return await func(update, context)
+        await update.message.reply_text("❌ Bạn không có quyền...")
+```
+
+Result: All `@require_admin` decorated handlers now accept whitelisted users.
+
+#### New Handlers (lines 652-705)
+
+**1. add_user_handler() - /add <chat_id> [username]**
+```python
+async def add_user_handler(update, context):
+    # Only ADMIN_CHAT_ID can call this
+    if update.effective_chat.id != config.ADMIN_CHAT_ID: return
+    
+    # Parse args
+    chat_id = int(context.args[0])
+    username = context.args[1] if len(context.args) > 1 else "unknown"
+    
+    # Add to DB
+    if db.add_to_whitelist(chat_id, username, update.effective_chat.id):
+        await update.message.reply_text(f"✅ Đã thêm {username}")
+```
+
+**2. remove_user_handler() - /remove <chat_id>**
+```python
+async def remove_user_handler(update, context):
+    # Only ADMIN
+    if update.effective_chat.id != config.ADMIN_CHAT_ID: return
+    
+    # Parse and remove
+    chat_id = int(context.args[0])
+    if db.remove_from_whitelist(chat_id):
+        await update.message.reply_text(f"✅ Đã xóa user {chat_id}")
+```
+
+**3. whitelist_handler() - /whitelist**
+```python
+async def whitelist_handler(update, context):
+    # Only ADMIN
+    if update.effective_chat.id != config.ADMIN_CHAT_ID: return
+    
+    # Get and display all whitelisted users
+    whitelist = db.get_whitelist()
+    message = "📋 **DANH SÁCH NGƯỜI DÙNG:**\n"
+    for chat_id, username in whitelist:
+        message += f"• {username} (ID: {chat_id})\n"
+    await update.message.reply_text(message, parse_mode='Markdown')
+```
+
+#### Handler Registration (lines 810-825)
+
+```python
+async def setup_application():
+    app = Application.builder().token(config.TELEGRAM_API_TOKEN).build()
+    
+    # Handlers
+    app.add_handler(CommandHandler('start', start_handler))
+    app.add_handler(CommandHandler('help', help_handler))
+    app.add_handler(CommandHandler('sys', sys_handler))
+    app.add_handler(CommandHandler('clear', clear_handler))
+    
+    # NEW Admin commands (Admin only)
+    app.add_handler(CommandHandler('add', add_user_handler))
+    app.add_handler(CommandHandler('remove', remove_user_handler))
+    app.add_handler(CommandHandler('whitelist', whitelist_handler))
+    
+    # Message handlers
+    app.add_handler(MessageHandler(filters.Document.TEXT, document_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    
+    return app
+```
+
+### 2. manage.sh (795 lines)
+
+Key functions:
+```bash
+check_bot()          # Check via PID file
+start_ollama()       # Run ollama serve
+start_bot()          # nohup python3 tele_agent.py
+stop_bot()           # Kill bot process
+get_logs()           # Show bot logs
+db_backup()          # Backup SQLite
+db_cleanup()         # Delete old messages >30 days
+```
+
+### 3. setup_system.sh (360 lines)
+
+Automated steps:
+1. Create swap file (4GB)
+2. Install Ollama
+3. Pull qwen2.5:7b model
+4. Create Python venv
+5. Install pip packages
+6. Setup systemd service (optional)
+
+## 🔍 KEY IMPROVEMENTS (v1.2 vs v1.0)
+
+| Feature | v1.0 | v1.1 | v1.2 |
+|---------|------|------|------|
+| Single Admin | ✅ | ✅ | ✅ |
+| Whitelist Users | ❌ | ❌ | ✅ NEW |
+| /add /remove /whitelist | ❌ | ❌ | ✅ NEW |
+| Threads | 4 | 4 | 8 ✅ |
+| Temperature | 0.7 | 0.7 | 0.3 ✅ |
+| Vietnamese Enforcement | Basic | Good | Strong (example) ✅ |
+| Lock-based Queue | ❌ | ✅ | ✅ |
+| Ollama 409 Conflict | ❌ | ✅ | ✅ |
+
+## 🔐 Security Model
+
+### Access Control
+```
+┌─ ADMIN_CHAT_ID (from .env)
+│  └─ Can do ALL commands (/start, /add, /remove, /sys, /clear)
+│
+└─ Whitelisted Users (in DB)
+   └─ Can do regular commands (/start, /sys, /clear, chat, files)
+      BUT NOT /add, /remove, /whitelist
+```
+
+### Database Isolation
+- Each user's conversation is separate (chat_id as key)
+- Whitelist stored in dedicated table
+- No cross-user data leakage
+
+### API Token Security
+- Never printed to logs
+- Loaded from .env (git ignored)
+- Used only for Telegram API calls
+
+## 📊 Performance Metrics
+
+### Tested on Fedora 41, 12-core CPU, 15GB RAM
+
+```
+Ollama Model Load:
+  ├─ First startup: 5-8 seconds
+  ├─ Warm load: 1-2 seconds
+  └─ GPU: None (CPU only)
+
+Response Time:
+  ├─ Simple query ("Xin chào"): ~4 seconds
+  ├─ Complex query (long text): ~8-10 seconds
+  ├─ File analysis (.txt): ~10-15 seconds
+  └─ Whitelist operations: <100ms
+
+Memory Usage:
+  ├─ Ollama (model): ~4.7GB
+  ├─ Python bot: ~60MB
+  ├─ SQLite cache: <5MB
+  └─ Total: ~11GB base (+ swap)
+
+Concurrency:
+  ├─ Queue handling: Serialized (1 at a time)
+  ├─ Lock acquire time: <1ms
+  └─ Maximum queue depth: Unlimited (waits in line)
+```
+
+## 🛠️ Development Guidelines
+
+### Adding New Commands
+```python
+async def my_command_handler(update, context):
+    chat_id = update.effective_chat.id
+    
+    # Add decorator if need admin/whitelist
+    @require_admin
+    
+    # Respond
+    await update.message.reply_text("Response")
+    
+    # Register in setup_application()
+    app.add_handler(CommandHandler('mycommand', my_command_handler))
+```
+
+### Modifying AI Behavior
+Locate: `AIAgent.generate_response()` line ~360
+```python
+if not system_prompt:
+    system_prompt = """Your new system prompt..."""
+```
+
+### Adding Database Fields
+1. Edit `_init_database()` in ChatDatabase
+2. Create new table or ALTER existing
+3. Add getter/setter methods
+4. Test with fresh .db file (or migrate existing)
+
+## 📚 External Dependencies
+
+```
+python-telegram-bot==20.7      # Telegram interface
+ollama==0.1.48                  # Ollama Python client
+aiohttp==3.9.X                  # Async HTTP
+psutil==5.9.X                   # System monitors  
+python-dotenv==1.0.X            # .env file loading
+asyncio-contextmanager==1.0.0   # Compatibility
+```
+
+## 🚀 Deployment Checklist
+
+- [ ] Ollama installed and qwen2.5:7b pulled
+- [ ] .env file configured with TELEGRAM_API_TOKEN
+- [ ] ADMIN_CHAT_ID set correctly in .env
+- [ ] Python venv created and packages installed
+- [ ] Bot tested with /start command
+- [ ] Message response verified
+- [ ] Whitelist feature tested (/add, /remove, /whitelist)
+- [ ] manage.sh scripts have execute permissions
+- [ ] Database backed up
+- [ ] Logs monitored for errors
+
+---
+
+**Version:** 1.2-whitelist | **Last Updated:** 2026-02-27 | **Maintained By:** Duy Hieu
 
 ## 📋 MỤC TIÊU PROJECT (Project Goal)
 
