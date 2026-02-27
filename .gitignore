@@ -1,0 +1,83 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+pip-wheel-metadata/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+.venv
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+.project
+.pydevproject
+
+# Logging
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Temporary files
+data/temp_files/*
+!data/temp_files/.gitkeep
+*.tmp
+*.bak
+*.swp
+
+# Docker
+docker-compose.override.yml
+.dockerignore
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Backups
+*.tar.gz
+*.zip
+backup_*/
+
+# System
+.systemd
+.config
+
+# Bot specific
+bot_agent.log
+nohup.out
+*.pid
+
+# Keep important dirs
+!data/.gitkeep
+!data/temp_files/.gitkeep

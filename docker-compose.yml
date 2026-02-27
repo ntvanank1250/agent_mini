@@ -1,0 +1,35 @@
+version: '3.8'
+
+services:
+  # Open WebUI - Web interface for Ollama
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:latest
+    container_name: open-webui
+    ports:
+      - "3000:8080"
+    environment:
+      - OLLAMA_BASE_URL=http://host.docker.internal:11434
+      - OLLAMA_API_BASE_URL=http://host.docker.internal:11434/api
+    volumes:
+      - open-webui-data:/app/backend/data
+    depends_on:
+      - ollama
+    restart: unless-stopped
+    networks:
+      - ai-network
+
+  # Ollama - AI Engine (running on host, not in container)
+  # Note: Run `ollama serve` on host OS for better resource management on 8GB RAM
+
+volumes:
+  open-webui-data:
+    driver: local
+
+networks:
+  ai-network:
+    driver: bridge
+
+# Usage:
+# docker-compose up -d
+# docker-compose logs -f open-webui
+# docker-compose down
